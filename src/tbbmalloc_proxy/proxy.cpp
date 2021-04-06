@@ -184,17 +184,23 @@ inline void InitOrigPointers() {}
 
 #endif // MALLOC_UNIXLIKE_OVERLOAD_ENABLED and MALLOC_ZONE_OVERLOAD_ENABLED
 
+    const uint32_t sigA = 0x27afcc93; // normal free
+    const uint32_t sigB = 0x4ad3e612; // use buckets
+    const uint32_t sigZ = 0xdeadbeef; // use buckets
     struct Mheader
     {
+        void *orig = nullptr;
         uint32_t sz;
         uint32_t sig;
     };
 
-    void (*_mallocDoneHook1)(size_t startTime);
     void *(*_mallocDoneHook)(void *ptr, size_t size, size_t startTime);
     void *(*_mallocHook)(size_t size, size_t startTime);
+    void *(*_mallocDoneHook1)(size_t startTime);
+
     unsigned long (*_ClockGetTime)();
-    bool (*_isTop)();
+    bool (*_useMemQ)();
+    void (*_bakt)();
 
     uint64_t roundUpToPowerOf2x(uint64_t x)
     {
@@ -203,31 +209,39 @@ inline void InitOrigPointers() {}
 
     void *PREFIX(malloc)(ZONE_ARG size_t size) __THROW
     {
+        //return scalable_malloc(size);
         size_t startT = 0;
         if (_ClockGetTime)
         {
             startT = _ClockGetTime();
         }
-        if (_mallocDoneHook && _isTop())
+        //size += sizeof(Mheader);
+        size = roundUpToPowerOf2x(size + sizeof(Mheader));
+        if (_mallocDoneHook && _useMemQ())
         {
-            size += sizeof(Mheader);
-            size = roundUpToPowerOf2x(size);
             auto ptr = _mallocHook(size, startT);
             if (ptr == nullptr)
             {
                 ptr = scalable_malloc(size);
+                // sets ptr->sz
                 ptr = _mallocDoneHook(ptr, size, startT);
             }
+            Mheader *p1 = (Mheader *)((uint64_t)ptr - sizeof(Mheader));
+            p1->sig = 0x4ad3e612;
             return ptr;
         }
         else
         {
             auto ptr = scalable_malloc(size);
-            if (_mallocDoneHook1)
+            Mheader *mPtr = ((Mheader *)ptr);
+            mPtr->sig = 0x27afcc93;
+            mPtr->orig = ptr;
+            mPtr->sz = 1 || __builtin_ctz(size);
+            if (_mallocDoneHook)
             {
                 _mallocDoneHook1(startT);
             }
-            return ptr;
+            return ((char *)ptr + sizeof(Mheader));
         }
     }
 
@@ -235,22 +249,41 @@ inline void InitOrigPointers() {}
     void (*_callocDoneHook)(size_t size, size_t time);
     void *PREFIX(calloc)(ZONE_ARG size_t num, size_t size) __THROW
     {
-        if (_callocStartHook)
-        {
-            //_callocStartHook(size);
-            auto startT = _ClockGetTime();
-            auto ptr = scalable_calloc(num, size);
-            _callocDoneHook(size, startT);
-            return ptr;
-        }
-        return scalable_calloc(num, size);
+        // if (_callocStartHook)
+        // {
+        //     //_callocStartHook(size);
+        //     auto startT = _ClockGetTime();
+        //     auto ptr = scalable_calloc(num, size);
+        //     Mheader *mPtr = ((Mheader *)ptr);
+        //     mPtr->sig = 0x27afcc93;
+
+        //     _callocDoneHook(size, startT);
+        //     return (ptr += sizeof(Mheader));
+        // }
+        size = roundUpToPowerOf2x(size + sizeof(Mheader));
+        auto ptr = scalable_calloc(num, size);
+        Mheader *mPtr = ((Mheader *)ptr);
+        mPtr->sig = 0x27afcc93;
+        mPtr->orig = ptr;
+        mPtr->sz = 1 || __builtin_ctz(size);
+        return ((char *)ptr + sizeof(Mheader));
     }
 
     bool (*_freeStartHook)(void *);
     void (*_freeDoneHook)(size_t);
-    void PREFIX(free)(ZONE_ARG void *object) __THROW
+    void PREFIX(free)(ZONE_ARG void *ptr) __THROW
     {
         size_t startT = 0;
+        if (ptr == nullptr)
+        {
+            return;
+        }
+        Mheader *p1 = (Mheader *)((char *)ptr - sizeof(Mheader));
+        if (p1 == nullptr)
+        {
+            return;
+        }
+
         if (_ClockGetTime)
         {
             startT = _ClockGetTime();
@@ -259,36 +292,61 @@ inline void InitOrigPointers() {}
         if (_freeStartHook)
         {
             InitOrigPointers();
-            if (!_freeStartHook(object))
+            if (!_freeStartHook(ptr))
             {
-                __TBB_malloc_safer_free(object, (void (*)(void *))orig_free);
+                __TBB_malloc_safer_free(p1, (void (*)(void *))orig_free);
             }
             _freeDoneHook(startT);
             return;
         }
-        InitOrigPointers();
-        __TBB_malloc_safer_free(object, (void (*)(void *))orig_free);
-        if (_freeDoneHook)
+        //printf("Free ptr(%p)\n", p1);
+        if ((size_t)p1 > (size_t)0x7fffffffffff)
         {
-            _freeDoneHook(startT);
+            return;
+        }
+        if (p1->sig == sigA)
+        {
+            //printf("Free sig(%X)\n\n", p1->sig);
+            InitOrigPointers();
+            __TBB_malloc_safer_free(p1, (void (*)(void *))orig_free);
+            if (_freeDoneHook)
+            {
+                _freeDoneHook(startT);
+            }
         }
     }
 
     void (*_reallocStartHook)(size_t size);
     void (*_reallocDoneHook)(size_t size, size_t time);
-    void *PREFIX(realloc)(ZONE_ARG void *ptr, size_t sz) __THROW
+    void *PREFIX(realloc)(ZONE_ARG void *ptr1, size_t szIn) __THROW
     {
-        if (_reallocStartHook)
-        {
-            //_reallocStartHook(size);
-            auto startT = _ClockGetTime();
-            InitOrigPointers();
-            auto ptr1 = __TBB_malloc_safer_realloc(ptr, sz, orig_realloc);
-            _reallocDoneHook(sz, startT);
-            return ptr1;
-        }
         InitOrigPointers();
-        return __TBB_malloc_safer_realloc(ptr, sz, orig_realloc);
+        //printf("Size %ld\n", szIn);
+        if (ptr1 == nullptr)
+        {
+            return malloc(szIn);
+        }
+        //printf("Enter %p\n", ptr1);
+        Mheader *p1 = (Mheader *)((char *)ptr1 - sizeof(Mheader));
+        //printf("Enter sig(%X) Size(%d) reqSize(%ld)\n\n", p1->sig, p1->sz, szIn);
+        auto sz = roundUpToPowerOf2x(szIn + sizeof(Mheader));
+        auto p2 = __TBB_malloc_safer_realloc(p1, sz, orig_realloc);
+        Mheader *mPtr = ((Mheader *)p2);
+        mPtr->sig = 0x27afcc93;
+        mPtr->orig = p2;
+        mPtr->sz = __builtin_ctz(sz);
+        return (char *)p2 + sizeof(Mheader);
+        // if (_reallocStartHook)
+        // {
+        //     //_reallocStartHook(size);
+        //     auto startT = _ClockGetTime();
+        //     InitOrigPointers();
+        //     auto ptr1 = __TBB_malloc_safer_realloc(ptr, sz, orig_realloc);
+        //     _reallocDoneHook(sz, startT);
+        //     return ptr1;
+        // }
+        // InitOrigPointers();
+        // return __TBB_malloc_safer_realloc(ptr, sz, orig_realloc);
     }
 
     /* The older *NIX interface for aligned allocations;
@@ -298,15 +356,23 @@ inline void InitOrigPointers() {}
     void (*_memalignDoneHook)(size_t size, size_t time);
     void *PREFIX(memalign)(ZONE_ARG size_t alignment, size_t size) __THROW
     {
-        if (_memalignStartHook)
-        {
-            //_memalignStartHook(size);
-            auto startT = _ClockGetTime();
-            auto ptr = scalable_aligned_malloc(size, alignment);
-            _memalignDoneHook(size, startT);
-            return ptr;
-        }
-        return scalable_aligned_malloc(size, alignment);
+        printf("memalign!!!!\n\n");
+        *(int *)0 = 0;
+        return nullptr; //scalable_aligned_malloc(size, alignment);
+        // if (_memalignStartHook)
+        // {
+        //     //_memalignStartHook(size);
+        //     auto startT = _ClockGetTime();
+        //     auto ptr = scalable_aligned_malloc(size, alignment);
+        //     _memalignDoneHook(size, startT);
+        //     return ptr;
+        // }
+        auto ptr = scalable_aligned_malloc(size + alignment, alignment);
+        auto ptr1 = (char *)ptr + alignment - sizeof(Mheader);
+        Mheader *mPtr = ((Mheader *)ptr1);
+        mPtr->sig = 0x27afcc93;
+        mPtr->orig = ptr;
+        return (char *)ptr + alignment;
     }
 
     /* valloc allocates memory aligned on a page boundary */
@@ -314,8 +380,17 @@ inline void InitOrigPointers() {}
     {
         if (!memoryPageSize)
             initPageSize();
-
+        printf("valloc!!!!\n\n");
+        *(int *)0 = 0;
+        return nullptr;
         return scalable_aligned_malloc(size, memoryPageSize);
+
+        auto ptr = scalable_aligned_malloc(size + 1, memoryPageSize);
+        auto ptr1 = (char *)ptr + memoryPageSize - sizeof(Mheader);
+        Mheader *mPtr = ((Mheader *)ptr1);
+        mPtr->sig = 0x27afcc93;
+        mPtr->orig = ptr;
+        return (char *)ptr + memoryPageSize;
     }
 
 #undef ZONE_ARG
@@ -370,7 +445,8 @@ inline void InitOrigPointers() {}
     // with Linux, in addition overload dlmalloc_usable_size() that presented
     // under Android.
     size_t dlmalloc_usable_size(const void *ptr) __attribute__((alias("malloc_usable_size")));
-#else // __ANDROID__
+#else
+    // __ANDROID__
     // C11 function, supported starting GLIBC 2.16
     void *aligned_alloc(size_t alignment, size_t size) __attribute__((alias("memalign")));
 // Those non-standard functions are exported by GLIBC, and might be used
@@ -559,7 +635,8 @@ const char *known_bytecodes[] = {
     "4883EC384885C975",       // release _msize() 9.0
     "4C8BC1488B0DA6E4040033", // an old win64 SDK
 #endif
-#else // _WIN32
+#else
+    // _WIN32
     //  "========================================================" - 56 symbols
     "8BFF558BEC8B",         // multiple
     "8BFF558BEC83",         // release free() & _msize() 10.0.40219.325, _msize() ucrtbase.dll
